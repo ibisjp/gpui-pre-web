@@ -1,3 +1,7 @@
+// Modified by ibis inc. for ibisOffice: Japanese documents' full-width
+// letters, digits and symbols (Ｕ＋FF01–FF60, ※, ①, ○, → and the like) are
+// eligible for the browser-font fallback, as the bundled fonts lack them.
+
 //! Eligibility only for independent, horizontal Canvas fallback of a complete
 //! extended grapheme. Callers must still check whether bundled shaping supplies
 //! the requested glyph and presentation; eligibility alone does not override it.
@@ -113,7 +117,33 @@ fn is_cjk(grapheme: &str) -> bool {
 
     suffix.is_empty()
         && (matches!(base, '\u{3131}'..='\u{3163}')
-            || "、。〈〉《》「」『』【】〔〕（）［］｛｝，．！？：；・ー々〆".contains(base))
+            || "、。〈〉《》「」『』【】〔〕（）［］｛｝，．！？：；・ー々〆".contains(base)
+            || is_japanese_symbol(base))
+}
+
+/// Symbols Japanese text uses that the bundled Latin fonts do not have:
+/// CJK punctuation, full-width and half-width forms, and the dashes,
+/// marks, arrows, shapes and enclosed numbers of JIS X 0208 and 0213.
+fn is_japanese_symbol(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303f}'   // CJK symbols and punctuation
+        | '\u{3097}'..='\u{309f}' // kana marks
+        | '\u{30fb}'..='\u{30ff}' // katakana middle dot, marks
+        | '\u{31f0}'..='\u{31ff}' // katakana phonetic extensions
+        | '\u{ff01}'..='\u{ff9f}' // full-width forms, half-width katakana
+        | '\u{ffe0}'..='\u{ffe6}' // full-width signs (￥ ￡ ￢ …)
+        | '\u{2010}'..='\u{2027}' // dashes, quotes, ‥ …
+        | '\u{2030}'..='\u{203b}' // ‰ ′ ″ ※
+        | '\u{2103}' | '\u{2116}' | '\u{2121}' | '\u{212b}' // ℃ № ℡ Å
+        | '\u{2160}'..='\u{217f}' // Roman numerals
+        | '\u{2190}'..='\u{21ff}' // arrows
+        | '\u{2200}'..='\u{22ff}' // mathematical operators
+        | '\u{2460}'..='\u{24ff}' // enclosed numbers (①)
+        | '\u{2500}'..='\u{257f}' // box drawing
+        | '\u{25a0}'..='\u{25ff}' // geometric shapes (□ ■ ○ ●)
+        | '\u{2605}' | '\u{2606}' | '\u{2640}' | '\u{2642}' // ★ ☆ ♀ ♂
+        | '\u{3200}'..='\u{33ff}' // enclosed CJK, CJK compatibility (㈱ ㎡)
+    )
 }
 
 fn is_single_modern_trailing_jamo(text: &str) -> bool {
@@ -229,6 +259,15 @@ fn is_supported_zwj_sequence(grapheme: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japanese_symbols_fall_back() {
+        for c in ["５", "※", "％", "＋", "①", "□", "●", "→", "―", "…", "㈱", "ｱ", "￥", "　"] {
+            assert!(is_cjk(c), "{c}");
+        }
+        assert!(!is_cjk("A"));
+        assert!(!is_cjk("5"));
+    }
 
     #[test]
     fn canvas_font_fallback_policy() {
