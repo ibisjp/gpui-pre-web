@@ -1,3 +1,7 @@
+// Modified by ibis inc. for ibisOffice: ignore IME-processed keydown events
+// (keyCode == 229, is_composing) before dispatching to the application,
+// preventing duplicate character entry and unwanted cell navigation on commit.
+
 use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
@@ -715,6 +719,16 @@ impl WebWindowInner {
                 }));
             }
 
+            // A key the IME is processing (the Enter or Space that commits
+            // or converts a composition, Safari's Enter right after
+            // `compositionend`) belongs to the IME, as on the native
+            // platforms: handing it to the app as well would, for one, make
+            // the Enter that commits a cell's text also move to the next
+            // cell, which then receives the committed text too.
+            if this.is_composing.get() || event.is_composing() || event.key_code() == 229 {
+                return;
+            }
+
             let key = dom_key_to_gpui_key(&event);
 
             if is_modifier_only_key(&key) {
@@ -742,11 +756,6 @@ impl WebWindowInner {
                     this.schedule_ime_mirror_sync();
                     return;
                 }
-            }
-
-            if this.is_composing.get() || event.is_composing() {
-                event.prevent_default();
-                return;
             }
 
             if keystroke_inserts_text(&modifiers, this.is_mac)
