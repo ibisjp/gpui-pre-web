@@ -671,13 +671,76 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
-            && let Some(window) = web_sys::window()
-        {
-            // Fire-and-forget; called synchronously inside the user's input
-            // event, which satisfies the browser's user-activation requirement.
-            drop(window.navigator().clipboard().write_text(&text));
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let has_image = item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::Image(_)));
+        if !has_image {
+            if let Some(text) = item.text() {
+                // Fire-and-forget; called synchronously inside the user's input
+                // event, which satisfies the browser's user-activation requirement.
+                drop(window.navigator().clipboard().write_text(&text));
+            }
+            return;
         }
+        // Modified for ibisOffice: images are written with `ClipboardItem` (PNG as it is,
+        // SVG drawn to a PNG in the browser: Chrome's clipboard takes no `image/svg+xml`).
+        let navigator = window.navigator();
+        let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
+            .is_ok_and(|clipboard| !clipboard.is_undefined() && !clipboard.is_null());
+        if !clipboard_available {
+            return;
+        }
+        let record = js_sys::Object::new();
+        let mut has_png = false;
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(image) = entry {
+                if has_png {
+                    continue;
+                }
+                let value: JsValue = match image.format {
+                    ImageFormat::Png => match bytes_blob(&image.bytes, "image/png") {
+                        Ok(blob) => blob.into(),
+                        Err(_) => continue,
+                    },
+                    ImageFormat::Svg => svg_to_png_promise(image.bytes.clone()).into(),
+                    _ => continue,
+                };
+                let _ = js_sys::Reflect::set(&record, &"image/png".into(), &value);
+                has_png = true;
+            }
+        }
+        if !has_png {
+            if let Some(text) = item.text() {
+                drop(navigator.clipboard().write_text(&text));
+            }
+            return;
+        }
+        if let Some(text) = item.text()
+            && let Ok(blob) = bytes_blob(text.as_bytes(), "text/plain")
+        {
+            let _ = js_sys::Reflect::set(&record, &"text/plain".into(), &blob);
+        }
+        let Ok(clipboard_item) =
+            web_sys::ClipboardItem::new_with_record_from_str_to_blob_promise(&record)
+        else {
+            return;
+        };
+        // `write()` is called synchronously inside the user's input event (the
+        // activation); the SVG's drawing finishes later through the promise.
+        let write = navigator
+            .clipboard()
+            .write(&js_sys::Array::of1(&clipboard_item));
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(error) = wasm_bindgen_futures::JsFuture::from(write).await {
+                web_sys::console::warn_1(
+                    &format!("failed to write the image to the clipboard: {}", js_error_message(&error)).into(),
+                );
+            }
+        });
     }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
@@ -722,6 +785,44 @@ fn clipboard_read_rejection_error(error: JsValue) -> ClipboardReadError {
         }
         _ => ClipboardReadError::UnsupportedContent,
     }
+}
+
+fn bytes_blob(bytes: &[u8], mime_type: &str) -> Result<web_sys::Blob, JsValue> {
+    let array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::of1(&array);
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime_type);
+    web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options)
+}
+
+/// A promise of the PNG of an SVG (drawn at twice its size, on a white-less transparent canvas).
+fn svg_to_png_promise(svg: Vec<u8>) -> js_sys::Promise {
+    wasm_bindgen_futures::future_to_promise(async move {
+        let text = String::from_utf8_lossy(&svg).into_owned();
+        let url = format!(
+            "data:image/svg+xml;charset=utf-8,{}",
+            js_sys::encode_uri_component(&text)
+        );
+        let image = web_sys::HtmlImageElement::new()?;
+        image.set_src(&url);
+        wasm_bindgen_futures::JsFuture::from(image.decode()).await?;
+        let scale = 2.0;
+        let width = ((image.natural_width().max(1) as f64) * scale).min(8192.0) as u32;
+        let height = ((image.natural_height().max(1) as f64) * scale).min(8192.0) as u32;
+        let canvas = web_sys::OffscreenCanvas::new(width, height)?;
+        let context: web_sys::OffscreenCanvasRenderingContext2d = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("no 2d context"))?
+            .unchecked_into();
+        context.draw_image_with_html_image_element_and_dw_and_dh(
+            &image,
+            0.0,
+            0.0,
+            width as f64,
+            height as f64,
+        )?;
+        wasm_bindgen_futures::JsFuture::from(canvas.convert_to_blob()?).await
+    })
 }
 
 async fn read_clipboard_item_blob(
