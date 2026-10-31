@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow, ensure};
 use gpui::{Bounds, DevicePixels};
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{OffscreenCanvas, OffscreenCanvasRenderingContext2d};
 
@@ -9,6 +9,7 @@ const MAX_RASTER_PIXELS: usize = 4 * 1024 * 1024;
 
 thread_local! {
     static CANVAS: RefCell<Option<TextCanvas>> = const { RefCell::new(None) };
+    static INSTALLED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +113,33 @@ pub(crate) fn measure(text: &str, css_font: &str) -> Result<CanvasTextMetrics> {
         );
         Ok(metrics)
     })
+}
+
+/// Whether the browser has a typeface named `family` installed (or aliases it).
+///
+/// A Canvas draws a name it does not know with the generic family that follows
+/// it, so a name is known when a string is wider or narrower with it than
+/// with each of the three generic families alone. Fonts that cannot be
+/// told apart from all three of them do not exist.
+pub(crate) fn family_installed(family: &str) -> bool {
+    if let Some(known) = INSTALLED.with(|cache| cache.borrow().get(family).copied()) {
+        return known;
+    }
+    let installed = (|| -> Result<bool> {
+        const PROBE: &str = "mmmmmmmmmmlli0123456789ABCDEFxyzWjg";
+        let quoted = format!("\"{}\"", family.replace(['\\', '"'], " "));
+        for generic in ["monospace", "serif", "sans-serif"] {
+            let alone = measure(PROBE, &format!("72px {generic}"))?.advance;
+            let named = measure(PROBE, &format!("72px {quoted}, {generic}"))?.advance;
+            if (alone - named).abs() > 0.01 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })()
+    .unwrap_or(false);
+    INSTALLED.with(|cache| cache.borrow_mut().insert(family.to_owned(), installed));
+    installed
 }
 
 pub(crate) fn rasterize(

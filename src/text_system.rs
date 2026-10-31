@@ -1,4 +1,6 @@
-use crate::canvas_fallback::{CanvasFontFallback, classify_canvas_fallback};
+use crate::canvas_fallback::{
+    CanvasFontFallback, classify_canvas_fallback, is_latin_grapheme, requested_family_names,
+};
 use crate::canvas_text::{self, CanvasTextMetrics};
 use crate::glyph_cache::{CanvasGlyph, GlyphCache};
 use crate::run_replacements::{Replacement, apply_replacements, collect_candidates};
@@ -10,7 +12,11 @@ use gpui::{
 };
 use gpui_wgpu::CosmicTextSystem;
 use parking_lot::RwLock;
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 // Cosmic's font IDs index its loaded-font vector. Keep browser IDs in a disjoint namespace.
 const CANVAS_FONT_BIT: usize = 1 << (usize::BITS - 1);
@@ -36,6 +42,9 @@ struct CanvasFont {
     native_id: FontId,
     descriptor: Font,
     monospace: bool,
+    /// The first typeface the document asks for (or an alias of it) that the
+    /// browser has installed: half-width Latin text is drawn with it (ibis).
+    latin_family: OnceLock<Option<String>>,
 }
 
 impl State {
@@ -116,9 +125,27 @@ impl WebTextSystem {
             native_id,
             descriptor,
             monospace,
+            latin_family: OnceLock::new(),
         }));
         state.canvas_font_ids.insert(native_id, font_id);
         Ok(font_id)
+    }
+
+    /// Whether Latin text in the native font `native_id` is drawn by the browser,
+    /// because the typeface its document names is installed there.
+    fn browser_draws_latin(&self, native_id: FontId) -> bool {
+        let has_names = self
+            .state
+            .read()
+            .descriptors
+            .get(&native_id)
+            .is_some_and(|font| font.fallbacks.is_some());
+        has_names
+            && self
+                .canvas_font_id(native_id)
+                .ok()
+                .and_then(|font_id| self.canvas_font(font_id))
+                .is_some_and(|font| font.latin_family().is_some())
     }
 
     fn register_glyph(&self, font_id: FontId, text: &str, color: bool) -> Result<GlyphId> {
@@ -155,7 +182,7 @@ impl WebTextSystem {
             .canvas_font(font_id)
             .context("invalid Canvas font ID")?;
         let glyph = self.canvas_glyph(font_id, glyph_id)?;
-        let metrics = canvas_text::measure(&glyph.text, &font.css_font(font_size, glyph.color)?)?;
+        let metrics = canvas_text::measure(&glyph.text, &font.css_font(font_size, glyph.color, &glyph.text)?)?;
         ensure!(metrics.advance >= 0.0, "Canvas returned a negative advance");
         let mut state = self.state.write();
         if state.measurements.len() >= MAX_MEASUREMENTS {
@@ -187,21 +214,40 @@ impl WebTextSystem {
 
     fn apply_fallback(&self, text: &str, font_runs: &[FontRun], layout: &mut LineLayout) {
         if self.canvas_font_fallback == CanvasFontFallback::Disabled
-            || text.is_ascii()
             || !f32::from(layout.font_size).is_finite()
             || layout.font_size <= px(0.)
         {
             return;
         }
         let mut replacements = Vec::new();
-        for candidate in collect_candidates(text, font_runs, layout) {
+        let latin_allowed = self.canvas_font_fallback == CanvasFontFallback::EmojiAndCjk;
+        let candidates = collect_candidates(text, font_runs, layout, |font_id| {
+            latin_allowed && self.browser_draws_latin(font_id)
+        });
+        // A ligature ("fi") is one glyph for two graphemes: only the first has
+        // a glyph of its own. Replacing it would drop the second letter.
+        let mut ligated = vec![false; candidates.len()];
+        for index in 1..candidates.len() {
+            if candidates[index].latin
+                && candidates[index].glyphs.is_none()
+                && candidates[index - 1].source.end == candidates[index].source.start
+            {
+                ligated[index - 1] = true;
+            }
+        }
+        for (index, candidate) in candidates.into_iter().enumerate() {
             if !self.canvas_font_fallback.allows(candidate.is_emoji) {
                 continue;
             }
             let Some(glyphs) = candidate.glyphs else {
                 continue;
             };
-            if !glyphs.contiguous || !(glyphs.missing || (candidate.color && !glyphs.native_color))
+            if candidate.latin {
+                if ligated[index] || glyphs.range.len() != 1 {
+                    continue;
+                }
+            } else if !glyphs.contiguous
+                || !(glyphs.missing || (candidate.color && !glyphs.native_color))
             {
                 continue;
             }
@@ -383,7 +429,11 @@ impl PlatformTextSystem for WebTextSystem {
             return self.native.rasterize_glyph(params, bounds);
         };
         let glyph = self.canvas_glyph(params.font_id, params.glyph_id)?;
-        let css_font = font.css_font(params.font_size * params.scale_factor, glyph.color)?;
+        let css_font = font.css_font(
+            params.font_size * params.scale_factor,
+            glyph.color,
+            &glyph.text,
+        )?;
         let mut pixels = canvas_text::rasterize(
             &glyph.text,
             &css_font,
@@ -444,7 +494,20 @@ impl PlatformTextSystem for WebTextSystem {
 }
 
 impl CanvasFont {
-    fn css_font(&self, font_size: Pixels, color: bool) -> Result<String> {
+    fn latin_family(&self) -> Option<&str> {
+        self.latin_family
+            .get_or_init(|| {
+                let fallbacks = self.descriptor.fallbacks.as_ref()?;
+                requested_family_names(fallbacks.fallback_list())
+                    .find(|name| canvas_text::family_installed(name))
+                    .map(str::to_owned)
+            })
+            .as_deref()
+    }
+
+    /// The CSS font for `text`. Half-width Latin text puts the installed
+    /// typeface the document names first, so it and its measurement agree.
+    fn css_font(&self, font_size: Pixels, color: bool, text: &str) -> Result<String> {
         let font_size = f32::from(font_size);
         ensure!(
             font_size.is_finite() && font_size > 0.,
@@ -456,6 +519,9 @@ impl CanvasFont {
             FontStyle::Oblique => "oblique",
         };
         let mut families = Vec::new();
+        if !color && is_latin_grapheme(text) {
+            families.extend(self.latin_family().map(quote_family));
+        }
         if !color && !self.descriptor.family.starts_with('.') {
             families.push(quote_family(&self.descriptor.family));
         }
@@ -464,6 +530,7 @@ impl CanvasFont {
                 fallbacks
                     .fallback_list()
                     .iter()
+                    .filter(|family| !family.is_empty())
                     .map(|family| quote_family(family)),
             );
         }

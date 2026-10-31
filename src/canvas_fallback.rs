@@ -1,6 +1,10 @@
 // Modified by ibis inc. for ibisOffice: Japanese documents' full-width
 // letters, digits and symbols (Ｕ＋FF01–FF60, ※, ①, ○, → and the like) are
 // eligible for the browser-font fallback, as the bundled fonts lack them.
+// Also modified by ibis inc.: Latin graphemes (`is_latin_grapheme`) and the
+// separator in a font's fallback list (`LATIN_FALLBACK_SEPARATOR`) let the
+// text system draw half-width letters and digits with the typeface a document
+// names when the browser has it installed.
 
 //! Eligibility only for independent, horizontal Canvas fallback of a complete
 //! extended grapheme. Callers must still check whether bundled shaping supplies
@@ -39,6 +43,44 @@ impl CanvasFontFallback {
             Self::EmojiAndCjk => true,
         }
     }
+}
+
+/// An entry of a font's fallback list that ends the typefaces a document asks
+/// for (and their aliases). What follows it are stand-ins for East Asian
+/// text, which Latin text must not be drawn with.
+pub const LATIN_FALLBACK_SEPARATOR: &str = "";
+
+/// The typeface names of `fallbacks` that Latin text may be drawn with: the
+/// ones before the first [`LATIN_FALLBACK_SEPARATOR`] (all of them if there is
+/// none).
+pub fn requested_family_names(fallbacks: &[String]) -> impl Iterator<Item = &str> {
+    fallbacks
+        .iter()
+        .map(String::as_str)
+        .take_while(|name| *name != LATIN_FALLBACK_SEPARATOR)
+}
+
+/// Whether `grapheme` is one printable ASCII character or one Latin-script
+/// letter: text a typeface for Latin draws, which the bundled fonts also have.
+pub fn is_latin_grapheme(grapheme: &str) -> bool {
+    let mut characters = grapheme.chars();
+    let Some(base) = characters.next() else {
+        return false;
+    };
+    if characters.next().is_some() {
+        return false;
+    }
+    if base.is_ascii() {
+        return !base.is_ascii_control();
+    }
+    // Latin-1 letters, Latin Extended-A and -B, Latin Extended Additional
+    // (not the full-width forms, which have the Latin script too).
+    matches!(base, '\u{c0}'..='\u{24f}' | '\u{1e00}'..='\u{1eff}')
+        && !matches!(base, '\u{d7}' | '\u{f7}')
+        && matches!(
+            base.general_category(),
+            GeneralCategory::UppercaseLetter | GeneralCategory::LowercaseLetter
+        )
 }
 
 /// A supported grapheme assumed to be independently renderable.
@@ -525,5 +567,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["か\u{3099}", "👩🏽‍💻", "漢\u{e0100}"]
         );
+    }
+
+    #[test]
+    fn latin_graphemes_are_single_ascii_or_latin_letters() {
+        for text in ["a", "Z", "0", " ", "(", "~", "é", "Ł"] {
+            assert!(is_latin_grapheme(text), "{text:?}");
+        }
+        for text in ["", "ab", "\t", "\u{7f}", "あ", "Ａ", "１", "e\u{301}", "😀", "ж"] {
+            assert!(!is_latin_grapheme(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn requested_names_stop_at_the_separator() {
+        let list: Vec<String> = ["MS Mincho", "Times New Roman", "", "Hiragino Sans"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            requested_family_names(&list).collect::<Vec<_>>(),
+            ["MS Mincho", "Times New Roman"]
+        );
+        let none: Vec<String> = ["Arial"].map(String::from).to_vec();
+        assert_eq!(requested_family_names(&none).collect::<Vec<_>>(), ["Arial"]);
     }
 }

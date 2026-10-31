@@ -1,4 +1,4 @@
-use crate::canvas_fallback::classify_canvas_fallback;
+use crate::canvas_fallback::{classify_canvas_fallback, is_latin_grapheme};
 use gpui::{FontId, FontRun, LineLayout, Pixels, Point, ShapedGlyph, ShapedRun};
 use smallvec::SmallVec;
 use std::ops::Range;
@@ -10,6 +10,8 @@ pub(crate) struct Candidate {
     pub(crate) font_id: FontId,
     pub(crate) is_emoji: bool,
     pub(crate) color: bool,
+    /// Half-width Latin text of a font whose typeface the browser has (ibis).
+    pub(crate) latin: bool,
     pub(crate) glyphs: Option<GlyphSpan>,
 }
 
@@ -27,6 +29,7 @@ pub(crate) fn collect_candidates(
     text: &str,
     font_runs: &[FontRun],
     layout: &LineLayout,
+    browser_latin: impl Fn(FontId) -> bool,
 ) -> Vec<Candidate> {
     let mut font_runs = font_runs.iter().peekable();
     let mut font_run = font_runs.next();
@@ -48,6 +51,16 @@ pub(crate) fn collect_candidates(
             continue;
         }
         let Some(fallback) = classify_canvas_fallback(grapheme) else {
+            if is_latin_grapheme(grapheme) && browser_latin(run.font_id) {
+                candidates.push(Candidate {
+                    source: start..end,
+                    font_id: run.font_id,
+                    is_emoji: false,
+                    color: false,
+                    latin: true,
+                    glyphs: None,
+                });
+            }
             continue;
         };
         candidates.push(Candidate {
@@ -55,6 +68,7 @@ pub(crate) fn collect_candidates(
             font_id: run.font_id,
             is_emoji: fallback.is_emoji,
             color: fallback.emoji_presentation,
+            latin: false,
             glyphs: None,
         });
     }
@@ -235,6 +249,7 @@ mod tests {
                 font_id: FontId(7),
             }],
             &layout,
+            |_| false,
         );
         assert_eq!(candidates.len(), 2);
         let first = candidates.first().context("missing first candidate")?;
@@ -261,6 +276,25 @@ mod tests {
     }
 
     #[test]
+    fn latin_candidates_only_for_fonts_the_browser_has() {
+        let text = "A1 あ";
+        let mut layout = layout(&[1]);
+        layout.runs[0].glyphs = vec![source_glyph(0, 0.0, 5, false)];
+        let font_runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(7),
+        }];
+        let off = collect_candidates(text, &font_runs, &layout, |_| false);
+        assert_eq!(off.iter().filter(|c| c.latin).count(), 0);
+        let on = collect_candidates(text, &font_runs, &layout, |font| font == FontId(7));
+        let latin: Vec<_> = on.iter().filter(|c| c.latin).map(|c| c.source.clone()).collect();
+        assert_eq!(latin, [0..1, 1..2, 2..3]);
+        assert_eq!(on.len(), 4);
+        let other = collect_candidates(text, &font_runs, &layout, |font| font == FontId(8));
+        assert_eq!(other.iter().filter(|c| c.latin).count(), 0);
+    }
+
+    #[test]
     fn candidates_keep_graphemes_across_same_font_boundaries() -> Result<()> {
         let text = "か\u{3099}";
         let mut layout = layout(&[1, 1]);
@@ -276,7 +310,7 @@ mod tests {
                 font_id: FontId(7),
             },
         ];
-        let candidates = collect_candidates(text, &font_runs, &layout);
+        let candidates = collect_candidates(text, &font_runs, &layout, |_| false);
         assert_eq!(candidates.len(), 1);
         let span = candidates
             .first()
@@ -288,7 +322,7 @@ mod tests {
         assert!(span.contiguous);
 
         font_runs[1].font_id = FontId(8);
-        assert!(collect_candidates(text, &font_runs, &layout).is_empty());
+        assert!(collect_candidates(text, &font_runs, &layout, |_| false).is_empty());
         Ok(())
     }
 
@@ -308,6 +342,7 @@ mod tests {
                 font_id: FontId(7),
             }],
             &layout,
+            |_| false,
         );
         let first = candidates
             .first()
@@ -337,7 +372,7 @@ mod tests {
         }];
         for (id, color) in [(0, false), (1, false), (0, true), (1, true)] {
             layout.runs[0].glyphs = vec![source_glyph(0, 0.0, id, color)];
-            let candidates = collect_candidates("😀", &font_runs, &layout);
+            let candidates = collect_candidates("😀", &font_runs, &layout, |_| false);
             let candidate = candidates.first().context("missing candidate")?;
             assert!(candidate.color);
             let span = candidate.glyphs.as_ref().context("missing span")?;
@@ -345,7 +380,7 @@ mod tests {
             assert_eq!(span.native_color, color);
         }
         layout.runs[0].glyphs.clear();
-        let candidates = collect_candidates("😀", &font_runs, &layout);
+        let candidates = collect_candidates("😀", &font_runs, &layout, |_| false);
         assert!(
             candidates
                 .first()
