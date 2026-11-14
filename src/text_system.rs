@@ -3,6 +3,8 @@
 // face, the browser draws the text of that alias with the requested weight and style).
 // Also modified by ibis inc.: a CJK character no requested family covers is drawn by the browser, never in an unrelated loaded face (K0017).
 // Also modified by ibis inc.: `font_data`, `synthetic_style` and `font_variations` are the native text system's.
+// Also modified by ibis inc.: `drawn_glyph` tells a PDF what the browser's Canvas drew (the text and the families asked for), so that it can
+// write the text with a font file of its own.
 use crate::canvas_fallback::{
     CanvasFontFallback, classify_canvas_fallback, is_latin_grapheme, names_serif_family,
     requested_family_names,
@@ -14,7 +16,7 @@ use crate::run_replacements::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, FontStyle, GlyphId, Hsla, LineLayout,
+    Bounds, DevicePixels, DrawnGlyph, Font, FontId, FontMetrics, FontRun, FontStyle, GlyphId, Hsla, LineLayout,
     MissingGlyphSink, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
     SUBPIXEL_VARIANTS_Y, ShapedGlyph, Size, TextRenderingMode, point, px, size,
 };
@@ -462,6 +464,12 @@ impl PlatformTextSystem for WebTextSystem {
         self.native.synthetic_style(self.native_font_id(font_id))
     }
 
+    fn drawn_glyph(&self, font_id: FontId, glyph_id: GlyphId) -> Option<DrawnGlyph> {
+        let font = self.canvas_font(font_id)?;
+        let glyph = self.canvas_glyph(font_id, glyph_id).ok()?;
+        Some(font.drawn(&glyph.text, glyph.color))
+    }
+
     fn font_variations(&self, font_id: FontId) -> Vec<([u8; 4], f32)> {
         if self.canvas_font(font_id).is_some() {
             return Vec::new();
@@ -639,6 +647,35 @@ fn descriptor_names_serif(font: &Font) -> bool {
 }
 
 impl CanvasFont {
+    /// What the browser draws `text` as: the families its CSS font names, first to last (without the generic ones, which `serif` and
+    /// `monospace` stand for), the weight and the style (for a PDF; ibis).
+    fn drawn(&self, text: &str, color: bool) -> DrawnGlyph {
+        let mut families: Vec<String> = Vec::new();
+        if !color && is_latin_grapheme(text) {
+            families.extend(self.latin_family().map(str::to_owned));
+        }
+        if !color && !self.descriptor.family.starts_with('.') {
+            families.push(self.descriptor.family.to_string());
+        }
+        if let Some(fallbacks) = &self.descriptor.fallbacks {
+            families.extend(fallbacks.fallback_list().iter().filter(|family| !family.is_empty()).cloned());
+        }
+        let serif = !color && !self.monospace && descriptor_names_serif(&self.descriptor);
+        if !color && !self.monospace {
+            let list: &[&str] = if serif { &MINCHO_FAMILIES } else { &GOTHIC_FAMILIES };
+            families.extend(list.iter().map(|family| family.to_string()));
+        }
+        DrawnGlyph {
+            text: text.to_string(),
+            families,
+            weight: self.descriptor.weight.0,
+            italic: self.descriptor.style != FontStyle::Normal,
+            serif,
+            monospace: self.monospace,
+            color,
+        }
+    }
+
     fn latin_family(&self) -> Option<&str> {
         self.latin_family
             .get_or_init(|| {
