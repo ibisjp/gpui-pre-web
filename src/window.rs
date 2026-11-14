@@ -1,3 +1,4 @@
+// Modified by ibis inc. (#209): holds the PinchTracker for two-finger touch.
 // Modified by ibis inc. for ibisOffice: `update_ime_position` moves the hidden IME element, which is also put at the caret after every frame.
 
 use crate::display::WebDisplay;
@@ -65,6 +66,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
+    pub(crate) pinch: RefCell<crate::events::PinchTracker>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
@@ -223,6 +225,7 @@ impl WebWindow {
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
+            pinch: RefCell::new(crate::events::PinchTracker::default()),
             pressed_button: Cell::new(None),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),

@@ -1,3 +1,4 @@
+// Modified by ibis inc. (#209): two-finger touch is turned into PinchEvent (see PinchTracker).
 // Also modified by ibis inc.: the hidden IME element is placed at the text being composed, and at the caret on the keydown before the composition starts.
 // Modified by ibis inc. for ibisOffice: ignore IME-processed keydown events
 // (keyCode == 229, is_composing) before dispatching to the application,
@@ -9,7 +10,7 @@ use gpui::{
     ImeClause, Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+    PinchEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
     point, px,
 };
 use wasm_bindgen::prelude::*;
@@ -120,6 +121,155 @@ impl TouchIds {
     }
 }
 
+/// What the pinch tracker decided for a touch pointer going down.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PinchDown {
+    /// A normal single touch.
+    Single,
+    /// A second finger arrived: the single touch of `cancelled` (pointer id
+    /// and last position) must be cancelled and a pinch begins at `center`.
+    Begin {
+        cancelled: (i32, Point<Pixels>),
+        center: Point<Pixels>,
+    },
+    /// A finger of an ongoing or finished pinch gesture; not a single touch.
+    Ignored,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PinchMove {
+    Single,
+    /// `delta` is the change of the distance between the two fingers since
+    /// the previous event as a ratio (0.1 = 10% wider apart), `center` their
+    /// midpoint.
+    Update { center: Point<Pixels>, delta: f32 },
+    Ignored,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PinchUp {
+    Single,
+    /// One of the two pinching fingers left; the pinch ends at `center`.
+    End { center: Point<Pixels> },
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PinchMode {
+    Single,
+    Pinching { a: i32, b: i32, last_distance: f32 },
+    /// A pinch is over but fingers remain; they are not single touches until
+    /// every finger has been lifted.
+    Suppressed,
+}
+
+/// Turns the positions of touch pointers into two-finger pinch gestures.
+/// Pure logic (no DOM), so it is unit tested.
+pub(crate) struct PinchTracker {
+    fingers: HashMap<i32, Point<Pixels>>,
+    mode: PinchMode,
+}
+
+impl Default for PinchTracker {
+    fn default() -> Self {
+        Self {
+            fingers: HashMap::new(),
+            mode: PinchMode::Single,
+        }
+    }
+}
+
+fn pinch_geometry(a: Point<Pixels>, b: Point<Pixels>) -> (Point<Pixels>, f32) {
+    let dx = f32::from(a.x) - f32::from(b.x);
+    let dy = f32::from(a.y) - f32::from(b.y);
+    let center = point(
+        px((f32::from(a.x) + f32::from(b.x)) / 2.0),
+        px((f32::from(a.y) + f32::from(b.y)) / 2.0),
+    );
+    (center, (dx * dx + dy * dy).sqrt())
+}
+
+impl PinchTracker {
+    pub(crate) fn down(&mut self, id: i32, position: Point<Pixels>) -> PinchDown {
+        let previous: Vec<(i32, Point<Pixels>)> = self
+            .fingers
+            .iter()
+            .filter(|(other, _)| **other != id)
+            .map(|(other, pos)| (*other, *pos))
+            .collect();
+        self.fingers.insert(id, position);
+        match self.mode {
+            PinchMode::Single => match previous.as_slice() {
+                [] => PinchDown::Single,
+                [(other, other_position)] => {
+                    let (center, distance) = pinch_geometry(*other_position, position);
+                    self.mode = PinchMode::Pinching {
+                        a: *other,
+                        b: id,
+                        last_distance: distance,
+                    };
+                    PinchDown::Begin {
+                        cancelled: (*other, *other_position),
+                        center,
+                    }
+                }
+                _ => {
+                    self.mode = PinchMode::Suppressed;
+                    PinchDown::Ignored
+                }
+            },
+            PinchMode::Pinching { .. } | PinchMode::Suppressed => PinchDown::Ignored,
+        }
+    }
+
+    pub(crate) fn moved(&mut self, id: i32, position: Point<Pixels>) -> PinchMove {
+        if let Some(finger) = self.fingers.get_mut(&id) {
+            *finger = position;
+        }
+        match self.mode {
+            PinchMode::Single => PinchMove::Single,
+            PinchMode::Pinching { a, b, last_distance } if id == a || id == b => {
+                let (Some(&pa), Some(&pb)) = (self.fingers.get(&a), self.fingers.get(&b)) else {
+                    return PinchMove::Ignored;
+                };
+                let (center, distance) = pinch_geometry(pa, pb);
+                let delta = if last_distance > f32::EPSILON {
+                    distance / last_distance - 1.0
+                } else {
+                    0.0
+                };
+                self.mode = PinchMode::Pinching { a, b, last_distance: distance };
+                PinchMove::Update { center, delta }
+            }
+            _ => PinchMove::Ignored,
+        }
+    }
+
+    /// A finger went up or its pointer was cancelled.
+    pub(crate) fn up(&mut self, id: i32, position: Point<Pixels>) -> PinchUp {
+        if let Some(finger) = self.fingers.get_mut(&id) {
+            *finger = position;
+        }
+        let result = match self.mode {
+            PinchMode::Single => PinchUp::Single,
+            PinchMode::Pinching { a, b, .. } if id == a || id == b => {
+                let center = match (self.fingers.get(&a), self.fingers.get(&b)) {
+                    (Some(&pa), Some(&pb)) => pinch_geometry(pa, pb).0,
+                    _ => position,
+                };
+                self.mode = PinchMode::Suppressed;
+                PinchUp::End { center }
+            }
+            _ => PinchUp::Ignored,
+        };
+        self.fingers.remove(&id);
+        if self.fingers.is_empty() {
+            self.mode = PinchMode::Single;
+        }
+        result
+    }
+}
+
 impl Default for ClickState {
     fn default() -> Self {
         Self {
@@ -224,6 +374,15 @@ impl WebWindowInner {
         EventListenerHandle::add_non_passive(self.canvas.as_ref(), event_name, handler)
     }
 
+    fn dispatch_pinch(&self, position: Point<Pixels>, delta: f32, phase: TouchPhase) {
+        self.dispatch_input(PlatformInput::Pinch(PinchEvent {
+            position,
+            delta,
+            modifiers: Modifiers::default(),
+            phase,
+        }));
+    }
+
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
     }
@@ -263,6 +422,28 @@ impl WebWindowInner {
                 // gesture; only an editable tap may enable its keyboard again.
                 if this.keyboard_likely_dismissed() {
                     this.ime_mirror.set_virtual_keyboard_enabled(false);
+                }
+                match this.pinch.borrow_mut().down(event.pointer_id(), position) {
+                    PinchDown::Single => {}
+                    PinchDown::Ignored => return,
+                    PinchDown::Begin { cancelled, center } => {
+                        // The second finger interrupts the single-touch
+                        // gesture of the first, then the pinch starts.
+                        this.touch_tap_candidate.set(None);
+                        let first = this.touch_ids.borrow_mut().end(cancelled.0);
+                        if let Some(first_id) = first {
+                            this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                                id: first_id,
+                                phase: TouchPhase::Cancelled,
+                                position: cancelled.1,
+                                predicted_position: None,
+                                force: None,
+                            }));
+                        }
+                        this.state.borrow_mut().mouse_position = center;
+                        this.dispatch_pinch(center, 0.0, TouchPhase::Started);
+                        return;
+                    }
                 }
                 let Some(touch_id) = this.touch_ids.borrow_mut().start(event.pointer_id()) else {
                     log::error!("exhausted touch identifiers");
@@ -332,6 +513,15 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
 
             if event.pointer_type() == "touch" {
+                let pinch_up = this.pinch.borrow_mut().up(event.pointer_id(), position);
+                match pinch_up {
+                    PinchUp::Single => {}
+                    PinchUp::Ignored => return,
+                    PinchUp::End { center } => {
+                        this.dispatch_pinch(center, 0.0, TouchPhase::Ended);
+                        return;
+                    }
+                }
                 let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
                     return;
                 };
@@ -450,6 +640,18 @@ impl WebWindowInner {
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             if event.pointer_type() == "touch" {
+                let pinch_up = this
+                    .pinch
+                    .borrow_mut()
+                    .up(event.pointer_id(), pointer_position_in_element(&event));
+                match pinch_up {
+                    PinchUp::Single => {}
+                    PinchUp::Ignored => return,
+                    PinchUp::End { center } => {
+                        this.dispatch_pinch(center, 0.0, TouchPhase::Ended);
+                        return;
+                    }
+                }
                 let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
                     return;
                 };
@@ -597,6 +799,16 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
 
             if event.pointer_type() == "touch" {
+                let pinch_move = this.pinch.borrow_mut().moved(event.pointer_id(), position);
+                match pinch_move {
+                    PinchMove::Single => {}
+                    PinchMove::Ignored => return,
+                    PinchMove::Update { center, delta } => {
+                        this.state.borrow_mut().mouse_position = center;
+                        this.dispatch_pinch(center, delta, TouchPhase::Moved);
+                        return;
+                    }
+                }
                 let Some(touch_id) = this.touch_ids.borrow().active(event.pointer_id()) else {
                     return;
                 };
@@ -1495,5 +1707,55 @@ mod tests {
         let reused = touch_ids.start(7).expect("reused pointer touch id");
         assert_ne!(reused, first);
         assert_ne!(reused, concurrent);
+    }
+
+    fn pt(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    #[test]
+    fn second_finger_starts_a_pinch_and_reports_ratio_and_center() {
+        let mut t = PinchTracker::default();
+        assert_eq!(t.down(1, pt(100.0, 100.0)), PinchDown::Single);
+        assert_eq!(
+            t.down(2, pt(200.0, 100.0)),
+            PinchDown::Begin { cancelled: (1, pt(100.0, 100.0)), center: pt(150.0, 100.0) }
+        );
+        // distance 100 -> 150: +50%, center moves with the fingers
+        assert_eq!(
+            t.moved(2, pt(250.0, 100.0)),
+            PinchMove::Update { center: pt(175.0, 100.0), delta: 0.5 }
+        );
+        // 150 -> 75 (finger 1 moves in): -50%
+        assert_eq!(
+            t.moved(1, pt(175.0, 100.0)),
+            PinchMove::Update { center: pt(212.5, 100.0), delta: -0.5 }
+        );
+        assert_eq!(t.up(2, pt(250.0, 100.0)), PinchUp::End { center: pt(212.5, 100.0) });
+    }
+
+    #[test]
+    fn remaining_finger_is_not_a_single_touch_until_all_are_lifted() {
+        let mut t = PinchTracker::default();
+        t.down(1, pt(0.0, 0.0));
+        t.down(2, pt(10.0, 0.0));
+        assert!(matches!(t.up(2, pt(10.0, 0.0)), PinchUp::End { .. }));
+        assert_eq!(t.moved(1, pt(5.0, 5.0)), PinchMove::Ignored);
+        assert_eq!(t.up(1, pt(5.0, 5.0)), PinchUp::Ignored);
+        // all fingers up: a new touch is single again
+        assert_eq!(t.down(3, pt(1.0, 1.0)), PinchDown::Single);
+        assert_eq!(t.moved(3, pt(2.0, 2.0)), PinchMove::Single);
+        assert_eq!(t.up(3, pt(2.0, 2.0)), PinchUp::Single);
+    }
+
+    #[test]
+    fn a_third_finger_during_a_pinch_is_ignored() {
+        let mut t = PinchTracker::default();
+        t.down(1, pt(0.0, 0.0));
+        t.down(2, pt(0.0, 10.0));
+        assert_eq!(t.down(3, pt(50.0, 50.0)), PinchDown::Ignored);
+        assert_eq!(t.moved(3, pt(60.0, 60.0)), PinchMove::Ignored);
+        assert_eq!(t.up(3, pt(60.0, 60.0)), PinchUp::Ignored);
+        assert!(matches!(t.moved(2, pt(0.0, 20.0)), PinchMove::Update { .. }));
     }
 }
