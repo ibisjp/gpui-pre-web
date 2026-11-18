@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-19, GitHub K0037): a ligature of Latin letters is replaced by the browser's drawing as a whole (not left in the native font beside the browser's letters).
 // Also modified by ibis inc.: Japanese text no named family covers falls to a gothic face (`GOTHIC_FAMILIES`) before the generic `sans-serif`.
 // Also modified by ibis inc. (bold and italic asked of a family whose loaded face is regular: `font_id` returns an alias of the
 // face, the browser draws the text of that alias with the requested weight and style).
@@ -320,15 +321,18 @@ impl WebTextSystem {
         let candidates = collect_candidates(text, font_runs, layout, |font_id| {
             latin_allowed && self.browser_draws_latin(font_id)
         });
-        // A ligature ("fi") is one glyph for two graphemes: only the first has
-        // a glyph of its own. Replacing it would drop the second letter.
-        let mut ligated = vec![false; candidates.len()];
+        // A ligature ("fi") is one glyph for two graphemes: only the first has a glyph of its own. The browser draws the letters round it, so the ligature is replaced
+        // as a whole, from its first grapheme to its last (`ligature_end`): "ffi" is "f" and then the glyph of "fi" in the native font's design (Plex's), beside letters
+        // of the browser's face, when the glyph is left alone (ibis, K0037). The glyph's own width is replaced by the width the browser gives the whole text.
+        let mut base = (0..candidates.len()).collect::<Vec<_>>();
+        let mut ligature_end: Vec<Option<usize>> = vec![None; candidates.len()];
         for index in 1..candidates.len() {
             if candidates[index].latin
                 && candidates[index].glyphs.is_none()
                 && candidates[index - 1].source.end == candidates[index].source.start
             {
-                ligated[index - 1] = true;
+                base[index] = base[index - 1];
+                ligature_end[base[index]] = Some(candidates[index].source.end);
             }
         }
         for (index, candidate) in candidates.into_iter().enumerate() {
@@ -339,7 +343,7 @@ impl WebTextSystem {
                 continue;
             };
             if candidate.latin {
-                if ligated[index] || glyphs.range.len() != 1 {
+                if glyphs.range.len() != 1 {
                     continue;
                 }
             } else if !glyphs.contiguous
@@ -352,8 +356,9 @@ impl WebTextSystem {
                 continue;
             }
             let replacement = (|| -> Result<Replacement> {
+                let source = candidate.source.start..ligature_end[index].unwrap_or(candidate.source.end);
                 let text = text
-                    .get(candidate.source.clone())
+                    .get(source)
                     .context("invalid Canvas fallback source range")?;
                 let (font_id, glyph_id, metrics) = self.fallback_glyph(
                     candidate.font_id,
