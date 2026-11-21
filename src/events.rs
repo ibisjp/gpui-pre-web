@@ -3,6 +3,8 @@
 // Modified by ibis inc. for ibisOffice: ignore IME-processed keydown events
 // (keyCode == 229, is_composing) before dispatching to the application,
 // preventing duplicate character entry and unwanted cell navigation on commit.
+// Also modified by ibis inc. (#267): a recognized touch tap draws the pending frame inside the tap's `pointerup`, so the soft keyboard
+// is asked for while iOS Safari still counts the call as part of the user's gesture.
 
 use std::{collections::HashMap, rc::Rc};
 
@@ -10,7 +12,7 @@ use gpui::{
     ImeClause, Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    PinchDown, PinchEvent, PinchMove, PinchTracker, PinchUp, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+    PinchDown, PinchEvent, PinchMove, PinchTracker, PinchUp, Pixels, PlatformInput, Point, RequestFrameOptions, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
     point, px,
 };
 use wasm_bindgen::prelude::*;
@@ -395,6 +397,15 @@ impl WebWindowInner {
                     force: None,
                 }));
 
+                // ibis (#267): the tap has just moved the caret (or started an edit), but the input handler that says a text input is
+                // active is registered when the next frame is painted, which is after this event returns, outside the gesture: iOS
+                // Safari shows the soft keyboard only for a focus() made while it handles the user's gesture, so the keyboard never came
+                // up (and `pointer_targets_text_input` below found no handler yet on the first tap). Paint the pending frame now;
+                // the frame's `FocusGained` asks for the keyboard from here.
+                if completes_tap {
+                    this.render_pending_frame();
+                }
+
                 // A keyboard opening or closing mid-gesture reflows the
                 // layout, so the release position no longer refers to the
                 // content the user aimed at. Do not summon the keyboard
@@ -594,6 +605,21 @@ impl WebWindowInner {
             // so a coalesced cycle loses nothing.
             self.focus_ime_mirror();
         }
+    }
+
+    /// Paints the frame the window has pending, now, instead of at the next `requestAnimationFrame` (nothing is painted when
+    /// nothing changed). Called from event handlers only, never from inside a frame (a frame in progress has taken the callback
+    /// out of its slot, so a nested call does nothing).
+    fn render_pending_frame(&self) {
+        self.with_callback(
+            |callbacks| &mut callbacks.request_frame,
+            |callback| {
+                callback(RequestFrameOptions {
+                    require_presentation: false,
+                    force_render: false,
+                })
+            },
+        );
     }
 
     /// Restarts DOM input without synchronously re-entering GPUI activation.
@@ -1126,6 +1152,26 @@ impl WebWindowInner {
                 "insertLineBreak" | "insertParagraph" => {
                     event.prevent_default();
                     this.dispatch_synthetic_keystroke("enter", Modifiers::default());
+                    this.schedule_ime_mirror_sync();
+                }
+                // ibis (#267): the mirror holds the caret's paragraph, so a backspace at its start (or a forward delete at its end) leaves
+                // the element as it is and no `input` event follows; the document's caret has more to delete there (the paragraph
+                // break before it), so the key goes to the keybindings as it would from a keyboard.
+                "deleteContentBackward"
+                    if this.ime_mirror.selection_start() == Some(0)
+                        && this.ime_mirror.element_selection_end() == Some(0) =>
+                {
+                    event.prevent_default();
+                    this.dispatch_synthetic_keystroke("backspace", Modifiers::default());
+                    this.schedule_ime_mirror_sync();
+                }
+                "deleteContentForward"
+                    if this.ime_mirror.selection_start() == this.ime_mirror.element_selection_end()
+                        && this.ime_mirror.selection_start().map(|c| c as usize)
+                            == Some(this.ime_mirror.value().encode_utf16().count()) =>
+                {
+                    event.prevent_default();
+                    this.dispatch_synthetic_keystroke("delete", Modifiers::default());
                     this.schedule_ime_mirror_sync();
                 }
                 // Everything else (insertText, deleteContent*, autocorrect's

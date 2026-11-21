@@ -1,5 +1,6 @@
 // Modified by ibis inc. (#209): holds the PinchTracker for two-finger touch.
 // Modified by ibis inc. for ibisOffice: `update_ime_position` moves the hidden IME element, which is also put at the caret after every frame.
+// Also modified by ibis inc. (#267): an iPad (iPadOS Safari, which answers as a Mac) is touch input.
 
 use crate::display::WebDisplay;
 use crate::events::{
@@ -179,11 +180,14 @@ impl WebWindow {
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
+        // ibis (#267): iPadOS Safari calls itself a Mac and answers `(pointer: fine)` when a trackpad or keyboard is attached, though
+        // its keyboard is the on-screen one the same as the iPhone's, so an iPad counts as touch input however the query answers.
         let touch_input = browser_window
             .match_media("(pointer: coarse)")
             .ok()
             .flatten()
-            .is_some_and(|query| query.matches());
+            .is_some_and(|query| query.matches())
+            || is_ipados_safari(&browser_window);
         let ime_mirror = ImeMirror::new(&document, &body, touch_input)?;
         let mut viewport = WebViewport::new(&document)?;
         viewport.update(&browser_window, &canvas)?;
@@ -1056,4 +1060,12 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_client_inset(&self, _inset: Pixels) {}
+}
+
+/// Whether this is Safari on an iPad: it reports a `Macintosh` user agent (and `MacIntel`), but a Mac has no touch screen.
+fn is_ipados_safari(browser_window: &web_sys::Window) -> bool {
+    let navigator = browser_window.navigator();
+    #[allow(deprecated)]
+    let is_mac = navigator.platform().is_ok_and(|platform| platform.contains("Mac"));
+    is_mac && navigator.max_touch_points() > 1
 }
