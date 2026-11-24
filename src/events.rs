@@ -785,6 +785,7 @@ impl WebWindowInner {
             }
 
             this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                touch_fingers: 0,
                 position,
                 delta,
                 modifiers,
